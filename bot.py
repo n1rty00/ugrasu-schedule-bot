@@ -1,5 +1,8 @@
-import logging
 import os
+os.system("pip install python-telegram-bot==13.15 --force-reinstall > /dev/null")
+
+
+import logging
 import aiohttp
 import aiosqlite
 import asyncio
