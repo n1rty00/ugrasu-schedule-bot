@@ -9,7 +9,10 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # === Конфигурация ===
-BOT_TOKEN = "8365448344:AAGwJ47kluVFnqcAbav322_lCPVvVwsMeVc"  # <-- вставь сюда токен своего бота
+import os
+from dotenv import load_dotenv
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN") # <-- вставь сюда токен своего бота
 DB_PATH = "schedule.db"
 GROUP_ID = 8861  # ID вашей группы в API УГРАСУ
 
