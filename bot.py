@@ -1,20 +1,22 @@
-import nest_asyncio
-nest_asyncio.apply()  # фикс для IDE с уже запущенным event loop
-
-import asyncio
-from datetime import date, timedelta, datetime
+import logging
+import os
 import aiohttp
 import aiosqlite
+import asyncio
+from datetime import date, timedelta, datetime
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
-# === Конфигурация ===
-import os
+from telegram.ext import Updater, CommandHandler, CallbackContext
 from dotenv import load_dotenv
+import nest_asyncio
+
+nest_asyncio.apply()
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN") # <-- вставь сюда токен своего бота
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "schedule.db"
-GROUP_ID = 8861  # ID вашей группы в API УГРАСУ
+GROUP_ID = 8861  # замени при необходимости
+
+logging.basicConfig(level=logging.INFO)
 
 # ======== Инициализация базы данных ========
 async def init_db():
@@ -35,32 +37,24 @@ async def init_db():
         """)
         await db.commit()
 
-# ======== Получение расписания с API ========
-async def fetch_schedule(from_date: str, to_date: str):
+# ======== Получение расписания ========
+async def fetch_schedule(from_date, to_date):
     url = "https://www.ugrasu.ru/api/directory/lessons"
-    params = {
-        "fromdate": from_date,
-        "todate": to_date,
-        "groupOid": GROUP_ID
-    }
+    params = {"fromdate": from_date, "todate": to_date, "groupOid": GROUP_ID}
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as response:
-            if response.status != 200:
-                print("Ошибка при запросе:", response.status)
+        async with session.get(url, params=params) as resp:
+            if resp.status != 200:
                 return []
-            return await response.json()
+            return await resp.json()
 
-# ======== Кэширование расписания в SQLite ========
 async def cache_schedule():
     start_date = (date.today() - timedelta(days=14)).isoformat()
     end_date = (date.today() + timedelta(days=14)).isoformat()
     lessons = await fetch_schedule(start_date, end_date)
     if not lessons:
-        print("Расписание пустое")
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        cutoff = (date.today() - timedelta(days=14)).isoformat()
-        await db.execute("DELETE FROM Schedule WHERE date < ?", (cutoff,))
+        await db.execute("DELETE FROM Schedule WHERE date < ?", ((date.today() - timedelta(days=14)).isoformat(),))
         for lesson in lessons:
             lesson_date = lesson.get("date", "").replace(".", "-")
             await db.execute("""
@@ -71,130 +65,104 @@ async def cache_schedule():
                 lesson.get("discipline", ""),
                 f"{lesson.get('beginLesson','')} - {lesson.get('endLesson','')}",
                 lesson.get("auditorium", ""),
-                lesson.get("kindOfWork", "")  # тип занятия (лекция, практика и т.д.)
+                lesson.get("kindOfWork", "")
             ))
         await db.commit()
-    print("✅ Расписание обновлено")
 
-# ======== Получение расписания из базы ========
-async def get_schedule_for_day(target_date: date):
+async def get_schedule_for_day(target_date):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT discipline, time, room, kind FROM Schedule WHERE date = ? ORDER BY time",
-            (target_date.isoformat(),)
-        ) as cursor:
-            return await cursor.fetchall()
+        async with db.execute("SELECT discipline, time, room, kind FROM Schedule WHERE date = ? ORDER BY time",
+                              (target_date.isoformat(),)) as cur:
+            return await cur.fetchall()
 
-async def get_schedule_for_week(start_date: date):
+async def get_schedule_for_week(start_date):
     monday = start_date - timedelta(days=start_date.weekday())
     saturday = monday + timedelta(days=5)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT date, discipline, time, room, kind FROM Schedule WHERE date BETWEEN ? AND ? ORDER BY date, time",
             (monday.isoformat(), saturday.isoformat())
-        ) as cursor:
-            return await cursor.fetchall()
+        ) as cur:
+            return await cur.fetchall()
 
-# ======== Сопоставление типов занятий с эмодзи ========
-def get_kind_emoji(kind: str) -> str:
+def get_kind_emoji(kind):
     if not kind:
         return ""
-    kind = kind.lower()
-    if "лекц" in kind:
+    k = kind.lower()
+    if "лекц" in k:
         return "🎓 Лекция"
-    elif "практ" in kind or "семин" in kind:
+    if "практ" in k:
         return "💬 Практика"
-    elif "лаб" in kind:
+    if "лаб" in k:
         return "🧪 Лабораторная"
-    elif "физ" in kind:
+    if "физ" in k:
         return "🏋️ Физическая культура"
-    else:
-        return f"📘 {kind.capitalize()}"
+    return f"📘 {kind.capitalize()}"
 
-# ======== Команды бота ========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 Привет! Я бот расписания вашей группы.\n\n"
+# ======== Команды ========
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "👋 Привет! Я бот расписания.\n\n"
         "📘 Команды:\n"
-        "• /schedule_today — расписание на сегодня\n"
-        "• /schedule_tomorrow — расписание на завтра\n"
-        "• /schedule_week — расписание с понедельника по субботу"
+        "/schedule_today — расписание на сегодня\n"
+        "/schedule_tomorrow — расписание на завтра\n"
+        "/schedule_week — расписание на неделю"
     )
-    await update.message.reply_text(text)
 
-async def schedule_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cache_schedule()
-    rows = await get_schedule_for_day(date.today())
+def schedule_today(update: Update, context: CallbackContext):
+    asyncio.run(cache_schedule())
+    rows = asyncio.run(get_schedule_for_day(date.today()))
     if not rows:
-        await update.message.reply_text("🎉 На сегодня занятий нет!")
+        update.message.reply_text("🎉 На сегодня занятий нет!")
         return
+    text = f"📅 Расписание на сегодня ({date.today().strftime('%d.%m.%Y')})\n\n"
+    for i, (disc, time_str, room, kind) in enumerate(rows, 1):
+        text += f"{i}. {disc}\n{get_kind_emoji(kind)}\n🕒 {time_str}\n🏫 {room}\n\n"
+    update.message.reply_text(text.strip())
 
-    text = f"📅 <b>Расписание на сегодня ({date.today().strftime('%d.%m.%Y')})</b>\n\n"
-    for i, (discipline, time_str, room, kind) in enumerate(rows, start=1):
-        kind_display = get_kind_emoji(kind)
-        text += f"{i}. <b>{discipline}</b>\n{kind_display}\n🕒 {time_str}\n🏫 {room}\n\n"
-    await update.message.reply_html(text.strip())
-
-async def schedule_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cache_schedule()
+def schedule_tomorrow(update: Update, context: CallbackContext):
+    asyncio.run(cache_schedule())
     target = date.today() + timedelta(days=1)
-    rows = await get_schedule_for_day(target)
+    rows = asyncio.run(get_schedule_for_day(target))
     if not rows:
-        await update.message.reply_text("🎉 На завтра занятий нет!")
+        update.message.reply_text("🎉 На завтра занятий нет!")
+        return
+    text = f"📅 Расписание на завтра ({target.strftime('%d.%m.%Y')})\n\n"
+    for i, (disc, time_str, room, kind) in enumerate(rows, 1):
+        text += f"{i}. {disc}\n{get_kind_emoji(kind)}\n🕒 {time_str}\n🏫 {room}\n\n"
+    update.message.reply_text(text.strip())
+
+def schedule_week(update: Update, context: CallbackContext):
+    asyncio.run(cache_schedule())
+    rows = asyncio.run(get_schedule_for_week(date.today()))
+    if not rows:
+        update.message.reply_text("🎉 На этой неделе занятий нет!")
         return
 
-    text = f"📅 <b>Расписание на завтра ({target.strftime('%d.%m.%Y')})</b>\n\n"
-    for i, (discipline, time_str, room, kind) in enumerate(rows, start=1):
-        kind_display = get_kind_emoji(kind)
-        text += f"{i}. <b>{discipline}</b>\n{kind_display}\n🕒 {time_str}\n🏫 {room}\n\n"
-    await update.message.reply_html(text.strip())
-
-async def schedule_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cache_schedule()
-    rows = await get_schedule_for_week(date.today())
-    if not rows:
-        await update.message.reply_text("🎉 На этой неделе занятий нет!")
-        return
-
-    text = "📅 <b>Расписание на неделю (Пн–Сб)</b>\n\n"
+    text = "📅 Расписание на неделю:\n\n"
     current_date = ""
-
-    weekdays = {
-        0: "Понедельник",
-        1: "Вторник",
-        2: "Среда",
-        3: "Четверг",
-        4: "Пятница",
-        5: "Суббота",
-        6: "Воскресенье"
-    }
-
-    for d, discipline, time_str, room, kind in rows:
-        d_obj = datetime.strptime(d, "%Y-%m-%d").date()
-        weekday_name = weekdays[d_obj.weekday()]
+    for d, disc, time_str, room, kind in rows:
         if d != current_date:
-            text += f"\n<b>📆 {weekday_name}, {d_obj.strftime('%d.%m')}</b>\n"
-            text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+            d_obj = datetime.strptime(d, "%Y-%m-%d").date()
+            text += f"\n📆 {d_obj.strftime('%A, %d.%m')}\n━━━━━━━━━━━\n"
             current_date = d
-        kind_display = get_kind_emoji(kind)
-        text += f"• <b>{discipline}</b>\n{kind_display} — {time_str} ({room})\n"
-    await update.message.reply_html(text.strip())
+        text += f"• {disc}\n{get_kind_emoji(kind)} — {time_str} ({room})\n"
+    update.message.reply_text(text.strip())
 
-# ======== Основная функция ========
-async def main_async():
-    await init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+# ======== Основной запуск ========
+def main():
+    asyncio.run(init_db())
+    updater = Updater(BOT_TOKEN)
+    dp = updater.dispatcher
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("schedule_today", schedule_today))
-    app.add_handler(CommandHandler("schedule_tomorrow", schedule_tomorrow))
-    app.add_handler(CommandHandler("schedule_week", schedule_week))
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("schedule_today", schedule_today))
+    dp.add_handler(CommandHandler("schedule_tomorrow", schedule_tomorrow))
+    dp.add_handler(CommandHandler("schedule_week", schedule_week))
 
-    print("✅ Бот запущен и готов к работе!")
-    await app.run_polling()
+    print("✅ Бот запущен!")
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
-    import nest_asyncio
-    nest_asyncio.apply()
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main_async())
+    main()
